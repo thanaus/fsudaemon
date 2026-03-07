@@ -6,7 +6,7 @@ import asyncio
 import random
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 # Add parent directory to PYTHONPATH so config is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,34 +20,10 @@ from db_manager import DatabaseManager
 from audit_matcher import AuditPointMatcher
 from models import S3Event
 
-# Configure standard Python logging (same as main.py)
-logging.basicConfig(
-    format="%(message)s",
-    stream=sys.stdout,
-    level=logging.INFO,
-)
-
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer(),
-    ],
-    context_class=dict,
-    logger_factory=LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
 logger = structlog.get_logger(__name__)
 
 
-def generate_s3_event_dicts(bucket: str, num_events: int) -> list:
+def generate_s3_event_dicts(bucket: str, num_events: int) -> list[dict]:
     """
     Generate fake S3 events (same format as sqs_ingest).
 
@@ -71,7 +47,7 @@ def generate_s3_event_dicts(bucket: str, num_events: int) -> list:
         prefix = random.choice(prefixes)
         filename = f"file_{i}_{random.randint(1000, 9999)}.txt"
         events.append({
-            'eventTime': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'eventTime': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
             'eventName': random.choice(event_types),
             's3': {
                 'bucket': {'name': bucket},
@@ -86,24 +62,24 @@ def generate_s3_event_dicts(bucket: str, num_events: int) -> list:
 
 
 def dicts_to_s3_events(
-    event_dicts: list,
+    event_dicts: list[dict],
     matcher: AuditPointMatcher,
-) -> list:
+) -> list[S3Event]:
     """Convert S3 event dicts to S3Event models with audit_point_ids."""
-    out = []
+    out: list[S3Event] = []
     for d in event_dicts:
         s3 = d.get('s3', {})
         bucket = s3.get('bucket', {}).get('name', '')
         obj = s3.get('object', {})
         key = obj.get('key', '')
         size = int(obj.get('size', 0))
-        version_id = obj.get('versionId')
+        version_id: str | None = obj.get('versionId')
         event_name = d.get('eventName', 'ObjectCreated:Put')
         event_time_str = d.get('eventTime', '')
         try:
             event_time = datetime.fromisoformat(event_time_str.replace('Z', '+00:00'))
         except Exception:
-            event_time = datetime.now(timezone.utc)
+            event_time = datetime.now(UTC)
 
         audit_point_ids = matcher.get_matching_audit_points(bucket, key)
         out.append(S3Event(
@@ -123,8 +99,8 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
     config = load_config()
     db = await DatabaseManager.create(
         config.get_db_dsn(),
-        min_size=1,
-        max_size=min(10, batch_size // 100 + 2),
+        min_size=config.db_pool_min_size,
+        max_size=config.db_pool_max_size,
     )
 
     try:
@@ -136,9 +112,9 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
         event_dicts = generate_s3_event_dicts(bucket, num_events)
         s3_events = dicts_to_s3_events(event_dicts, matcher)
 
-        total_inserted = 0
-        total_time = 0.0
-        batches = 0
+        total_inserted: int = 0
+        total_time: float = 0.0
+        batches: int = 0
 
         logger.info("db_inject_insert_start", total_events=len(s3_events), batch_size=batch_size)
         for i in range(0, len(s3_events), batch_size):
@@ -162,7 +138,34 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
         await db.pool.close()
 
 
+def _setup_logging() -> None:
+    """Configure stdlib logging and structlog. Must only be called from main()."""
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=logging.INFO,
+    )
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer(),
+        ],
+        context_class=dict,
+        logger_factory=LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
 def main() -> None:
+    _setup_logging()
+
     parser = argparse.ArgumentParser(
         description="Inject S3 events directly into the DB for benchmarks (no SQS)",
         formatter_class=argparse.RawDescriptionHelpFormatter,

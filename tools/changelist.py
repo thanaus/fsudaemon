@@ -3,66 +3,84 @@ changelist.py - Fetch all events between two audit points (keyset pagination).
 """
 import argparse
 import asyncio
+import logging
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Sequence
 
 # Add parent directory to PYTHONPATH so config is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import asyncpg
 import structlog
 from structlog.stdlib import LoggerFactory
-import logging
 
 from config import load_config
 from db_manager import DatabaseManager
 
-# Configure standard Python logging (same as main.py / other tools)
-logging.basicConfig(
-    format="%(message)s",
-    stream=sys.stdout,
-    level=logging.INFO,
-)
-
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer(),
-    ],
-    context_class=dict,
-    logger_factory=LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
 logger = structlog.get_logger(__name__)
 
+# Type alias for the batch handler: receives a list of rows, returns nothing.
+BatchHandler = Callable[[Sequence[asyncpg.Record]], Awaitable[None]]
 
-async def run_changelist(audit_point_id: int, audit_point_end: int, batch_size: int) -> None:
+
+async def _noop_handler(rows: Sequence[asyncpg.Record]) -> None:
+    """Default handler — does nothing. Replace with your own implementation."""
+    pass
+
+
+async def run_changelist(
+    audit_point_id: int,
+    audit_point_end: int,
+    batch_size: int,
+    row_handler: BatchHandler = _noop_handler,
+) -> None:
     """
     Fetch events for audit_point_id received before audit_point_end was created
     (keyset pagination, batch_size per page).
+
+    Args:
+        audit_point_id: First audit point ID (events that contain this audit point).
+        audit_point_end: Second audit point ID (events received before its creation date).
+        batch_size: Number of rows to fetch per page.
+        row_handler: Async callable invoked with each batch of rows.
+                     Defaults to a no-op. Replace to write, transform, forward, etc.
     """
     config = load_config()
     db = await DatabaseManager.create(
         config.get_db_dsn(),
-        min_size=1,
-        max_size=2,
+        min_size=config.db_pool_min_size,
+        max_size=config.db_pool_max_size,
     )
 
     try:
         async with db.pool.acquire() as conn:
+            start_date = await conn.fetchval(
+                "SELECT created_at FROM audit_points WHERE id = $1",
+                audit_point_id,
+            )
+            if start_date is None:
+                logger.error("audit_point_not_found", id=audit_point_id)
+                return
+
             limit_date = await conn.fetchval(
                 "SELECT created_at FROM audit_points WHERE id = $1",
                 audit_point_end,
             )
             if limit_date is None:
                 logger.error("audit_point_not_found", id=audit_point_end)
+                return
+
+            if limit_date <= start_date:
+                logger.error(
+                    "audit_points_inverted",
+                    audit_point_id=audit_point_id,
+                    audit_point_end=audit_point_end,
+                    start_date=str(start_date),
+                    limit_date=str(limit_date),
+                    message="audit_point_end must be strictly more recent than audit_point_id",
+                )
                 return
 
             logger.info(
@@ -99,10 +117,7 @@ async def run_changelist(audit_point_id: int, audit_point_end: int, batch_size: 
                 if not rows:
                     break
 
-                # --- Process each row here ---
-                for row in rows:
-                    pass  # e.g. write to file, transform, send to API, etc.
-                # -----------------------------
+                await row_handler(rows)
 
                 last_id = rows[-1]["id"]
                 total += len(rows)
@@ -123,7 +138,34 @@ async def run_changelist(audit_point_id: int, audit_point_end: int, batch_size: 
         await db.pool.close()
 
 
+def _setup_logging() -> None:
+    """Configure stdlib logging and structlog. Must only be called from main()."""
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=logging.INFO,
+    )
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer(),
+        ],
+        context_class=dict,
+        logger_factory=LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
 def main() -> None:
+    _setup_logging()
+
     parser = argparse.ArgumentParser(
         description="Fetch events between two audit points (keyset pagination)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -158,7 +200,14 @@ Examples:
         sys.exit(1)
 
     try:
-        asyncio.run(run_changelist(args.audit_point_id, args.audit_point_end, args.batch_size))
+        asyncio.run(
+            run_changelist(
+                args.audit_point_id,
+                args.audit_point_end,
+                args.batch_size,
+                # row_handler defaults to _noop_handler
+            )
+        )
     except Exception as e:
         logger.error("changelist_failed", error=str(e))
         sys.exit(1)

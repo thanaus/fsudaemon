@@ -50,7 +50,11 @@ class AuditPointMatcher:
             if ap.bucket not in new_audit_points:
                 new_audit_points[ap.bucket] = []
 
-            # Normalize prefix: ensure it ends with '/' unless empty (empty = match entire bucket)
+            # Normalize prefix:
+            # - empty string → matches the entire bucket (no prefix filter),
+            #   relies on str.startswith("") which always returns True
+            # - non-empty    → ensure trailing '/' to avoid partial segment matches
+            #   e.g. "data" becomes "data/" so it won't match "data-backup/file.txt"
             prefix = ap.prefix
             if prefix and not prefix.endswith("/"):
                 prefix += "/"
@@ -81,12 +85,21 @@ class AuditPointMatcher:
         Will return all 3 IDs.
 
         Args:
-            bucket: S3 bucket name
-            key: S3 object key
+            bucket: S3 bucket name (must be a non-empty string)
+            key: S3 object key (must be a non-empty string)
 
         Returns:
-            List of matching audit_point_ids (can be empty)
+            List of matching audit_point_ids (can be empty).
+            An audit point with an empty prefix matches all keys in the bucket.
+
+        Raises:
+            ValueError: If bucket or key is not a non-empty string.
         """
+        if not isinstance(bucket, str) or not bucket:
+            raise ValueError(f"Invalid S3 bucket: {bucket!r}")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"Invalid S3 key: {key!r}")
+
         if bucket not in self._audit_points:
             return []
 

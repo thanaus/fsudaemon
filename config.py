@@ -3,6 +3,7 @@ Centralized configuration for S3 Event Processor
 """
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote_plus
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,7 +16,7 @@ class Config(BaseSettings):
 
     # AWS Configuration
     aws_region: str
-    aws_access_key_id: str | None = None
+    aws_access_key_id: SecretStr | None = None
     aws_secret_access_key: SecretStr | None = None
     aws_endpoint_url: str | None = None
     sqs_queue_url: str
@@ -43,7 +44,7 @@ class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
-        case_sensitive=True,
+        case_sensitive=False,
     )
 
     @field_validator("sqs_batch_size")
@@ -75,11 +76,11 @@ class Config(BaseSettings):
             raise ValueError(f"Invalid log_level: {v!r}. Must be one of {valid}")
         return v.upper()
 
-    @field_validator("otlp_endpoint")
+    @field_validator("otlp_endpoint", "aws_endpoint_url")
     @classmethod
-    def validate_otlp_endpoint(cls, v: str | None) -> str | None:
+    def validate_http_endpoint(cls, v: str | None) -> str | None:
         if v is not None and not (v.startswith("http://") or v.startswith("https://")):
-            raise ValueError(f"otlp_endpoint must start with http:// or https://: {v!r}")
+            raise ValueError(f"Endpoint must start with http:// or https://: {v!r}")
         return v
 
     @model_validator(mode="after")
@@ -92,11 +93,10 @@ class Config(BaseSettings):
         return self
 
     def get_db_dsn(self) -> str:
-        """Returns PostgreSQL DSN for asyncpg"""
-        return (
-            f"postgresql://{self.db_user}:{self.db_password.get_secret_value()}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
-        )
+        """Returns PostgreSQL DSN for asyncpg."""
+        user = quote_plus(self.db_user)
+        password = quote_plus(self.db_password.get_secret_value())
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
 
 @lru_cache(maxsize=1)
