@@ -12,7 +12,7 @@ logger = structlog.get_logger(__name__)
 
 class SQSConsumer:
     """Asynchronous consumer for Amazon SQS"""
-    
+
     def __init__(
         self,
         queue_url: str,
@@ -27,7 +27,7 @@ class SQSConsumer:
     ):
         """
         Initializes the SQS consumer.
-        
+
         Args:
             queue_url: SQS queue URL
             instruments: OpenTelemetry instruments dict
@@ -48,50 +48,71 @@ class SQSConsumer:
         self.wait_time_seconds = wait_time_seconds
         self.visibility_timeout = visibility_timeout
         self.endpoint_url = endpoint_url
-        
+
         self.session = aioboto3.Session(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name
         )
-        
+
+        self._client = None
+        self._client_kw: Dict[str, Any] = {}
+        if endpoint_url:
+            self._client_kw["endpoint_url"] = endpoint_url
+
         logger.debug(
             "sqs_consumer_initialized",
             queue_url=queue_url,
             region=region_name,
             max_messages=max_messages
         )
-    
+
+    async def start(self) -> None:
+        """
+        Opens the persistent SQS client. Must be called before receiving messages.
+        """
+        self._client = await self.session.client("sqs", **self._client_kw).__aenter__()
+        logger.debug("sqs_client_started")
+
+    async def stop(self) -> None:
+        """
+        Closes the persistent SQS client. Must be called on shutdown.
+        """
+        if self._client is not None:
+            try:
+                await self._client.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning("sqs_client_close_error", error=str(e))
+            finally:
+                self._client = None
+                logger.debug("sqs_client_stopped")
+
     async def receive_message(self) -> List[Dict[str, Any]]:
         """
         Receives messages from SQS queue with long polling.
-        
+
         Returns:
             List of SQS messages (can be empty if no messages)
         """
         try:
-            client_kw: Dict[str, Any] = {}
-            if self.endpoint_url:
-                client_kw["endpoint_url"] = self.endpoint_url
-            async with self.session.client("sqs", **client_kw) as sqs:
-                start = time.perf_counter()
-                response = await sqs.receive_message(
-                    QueueUrl=self.queue_url,
-                    MaxNumberOfMessages=self.max_messages,
-                    WaitTimeSeconds=self.wait_time_seconds,
-                    VisibilityTimeout=self.visibility_timeout,
-                    AttributeNames=['All'],
-                    MessageAttributeNames=['All']
-                )
-                self.instruments["sqs_receive_message_seconds"].record(time.perf_counter() - start)
+            start = time.perf_counter()
+            response = await self._client.receive_message(
+                QueueUrl=self.queue_url,
+                MaxNumberOfMessages=self.max_messages,
+                WaitTimeSeconds=self.wait_time_seconds,
+                VisibilityTimeout=self.visibility_timeout,
+                AttributeNames=['All'],
+                MessageAttributeNames=['All']
+            )
+            self.instruments["sqs_receive_message_seconds"].record(time.perf_counter() - start)
 
             messages = response.get('Messages', [])
-            
+
             if messages:
                 logger.debug("messages_received", count=len(messages))
-            
+
             return messages
-            
+
         except ClientError as e:
             logger.error(
                 "sqs_receive_error",
@@ -102,80 +123,71 @@ class SQSConsumer:
         except Exception as e:
             logger.error("sqs_receive_unexpected_error", error=str(e))
             raise
-    
+
     async def delete_message_batch(self, receipt_handles: List[str]) -> int:
         """
         Deletes multiple messages in batch (up to 10).
-        
+
         Args:
             receipt_handles: List of receipt handles to delete
-        
+
         Returns:
             Number of successfully deleted messages
         """
         if not receipt_handles:
             return 0
-        
+
         batch_size = 10
         deleted_count = 0
-        
+
         try:
-            client_kw: Dict[str, Any] = {}
-            if self.endpoint_url:
-                client_kw["endpoint_url"] = self.endpoint_url
-            async with self.session.client("sqs", **client_kw) as sqs:
-                for i in range(0, len(receipt_handles), batch_size):
-                    batch = receipt_handles[i:i + batch_size]
-                    
-                    entries = [
-                        {
-                            'Id': str(idx),
-                            'ReceiptHandle': handle
-                        }
-                        for idx, handle in enumerate(batch)
-                    ]
+            for i in range(0, len(receipt_handles), batch_size):
+                batch = receipt_handles[i:i + batch_size]
 
-                    start = time.perf_counter()
-                    response = await sqs.delete_message_batch(
-                        QueueUrl=self.queue_url,
-                        Entries=entries
+                entries = [
+                    {
+                        'Id': str(idx),
+                        'ReceiptHandle': handle
+                    }
+                    for idx, handle in enumerate(batch)
+                ]
+
+                start = time.perf_counter()
+                response = await self._client.delete_message_batch(
+                    QueueUrl=self.queue_url,
+                    Entries=entries
+                )
+                self.instruments["sqs_delete_message_batch_seconds"].record(time.perf_counter() - start)
+
+                deleted_count += len(response.get('Successful', []))
+
+                if 'Failed' in response and response['Failed']:
+                    logger.warning(
+                        "batch_delete_partial_failure",
+                        failed_count=len(response['Failed'])
                     )
-                    self.instruments["sqs_delete_message_batch_seconds"].record(time.perf_counter() - start)
 
-                    deleted_count += len(response.get('Successful', []))
-                    
-                    if 'Failed' in response and response['Failed']:
-                        logger.warning(
-                            "batch_delete_partial_failure",
-                            failed_count=len(response['Failed'])
-                        )
-            
             logger.debug("messages_deleted_batch", count=deleted_count)
             return deleted_count
-            
+
         except Exception as e:
             logger.error("sqs_batch_delete_error", error=str(e))
             return deleted_count
-    
+
     async def get_queue_attributes(self) -> Dict[str, Any]:
         """
         Retrieves SQS queue attributes (message count, etc.).
-        
+
         Returns:
             Dictionary of queue attributes
         """
         try:
-            client_kw: Dict[str, Any] = {}
-            if self.endpoint_url:
-                client_kw["endpoint_url"] = self.endpoint_url
-            async with self.session.client("sqs", **client_kw) as sqs:
-                response = await sqs.get_queue_attributes(
-                    QueueUrl=self.queue_url,
-                    AttributeNames=['All']
-                )
-            
+            response = await self._client.get_queue_attributes(
+                QueueUrl=self.queue_url,
+                AttributeNames=['All']
+            )
             return response.get('Attributes', {})
-            
+
         except Exception as e:
             logger.error("sqs_get_attributes_error", error=str(e))
             return {}

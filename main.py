@@ -60,28 +60,28 @@ async def process_messages_loop(
 ) -> None:
     """
     Main loop for processing SQS messages.
-    
+
     Args:
         sqs_consumer: SQS consumer
         processor: Event processor
     """
     logger.debug("message_processing_loop_started")
-    
+
     consecutive_errors = 0
     max_consecutive_errors = 5
-    
+
     while not shutdown_event.is_set():
         try:
             messages = await sqs_consumer.receive_message()
-            
+
             if not messages:
                 consecutive_errors = 0
                 continue
-            
+
             logger.debug("messages_received", count=len(messages))
-            
+
             receipt_handles_to_delete = []
-            
+
             for message in messages:
                 try:
                     errors = await processor.process_message(message)
@@ -93,20 +93,20 @@ async def process_messages_loop(
                             message_id=message.get('MessageId'),
                             errors=errors
                         )
-                    
+
                 except Exception as e:
                     logger.error(
                         "message_processing_failed",
                         error=str(e),
                         message_id=message.get('MessageId')
                     )
-            
+
             if receipt_handles_to_delete:
                 deleted = await sqs_consumer.delete_message_batch(receipt_handles_to_delete)
                 logger.debug("messages_deleted_from_sqs", count=deleted)
-            
+
             consecutive_errors = 0
-            
+
         except KeyboardInterrupt:
             logger.debug("keyboard_interrupt_received")
             shutdown_event.set()
@@ -118,15 +118,15 @@ async def process_messages_loop(
                 error=str(e),
                 consecutive_errors=consecutive_errors
             )
-            
+
             if consecutive_errors >= max_consecutive_errors:
                 logger.error("max_consecutive_errors_reached", max=max_consecutive_errors)
                 shutdown_event.set()
                 break
-            
+
             # Exponential backoff
             await asyncio.sleep(min(2 ** consecutive_errors, 60))
-    
+
     logger.debug("message_processing_loop_stopped")
 
 
@@ -137,7 +137,7 @@ async def sync_audit_points(
     """
     Synchronizes audit points from database to matcher.
     Used at startup and when NOTIFY triggers a change.
-    
+
     Args:
         matcher: Audit point matcher
         db_manager: Database manager
@@ -158,24 +158,24 @@ async def listen_audit_points_changes(
     """
     Listens to PostgreSQL LISTEN/NOTIFY notifications for audit point changes.
     Automatically reloads audit points in real-time.
-    
+
     Args:
         matcher: Audit point matcher
         db_manager: Database manager
     """
     logger.debug("audit_listen_loop_starting")
-    
+
     async def on_change():
         await sync_audit_points(matcher, db_manager)
-    
+
     listener = AuditPointsListener(db_manager, on_change)
-    
+
     try:
         await listener.start_listening()
-        
+
         while not shutdown_event.is_set():
             await asyncio.sleep(1)
-            
+
     except Exception as e:
         logger.error("audit_listen_loop_error", error=str(e))
     finally:
@@ -192,9 +192,9 @@ def parse_args():
 async def main() -> None:
     """Main entry point"""
     parse_args()
-    
+
     logger.debug("s3_event_processor_starting")
-    
+
     # 1. Load configuration
     try:
         config = load_config()
@@ -224,15 +224,15 @@ async def main() -> None:
     except Exception as e:
         logger.error("database_connection_failed", error=str(e))
         sys.exit(1)
-    
+
     # 4. Load audit points
     try:
         audit_points = await db_manager.load_audit_points()
         matcher = AuditPointMatcher(audit_points)
-        
+
         stats = matcher.get_stats()
         logger.debug("audit_matcher_initialized", stats=stats)
-        
+
         if len(audit_points) == 0:
             logger.warning(
                 "no_audit_points_configured",
@@ -242,8 +242,8 @@ async def main() -> None:
         logger.error("audit_points_load_failed", error=str(e))
         await db_manager.pool.close()
         sys.exit(1)
-    
-    # 5. Create SQS consumer
+
+    # 5. Create and start SQS consumer (persistent client)
     try:
         sqs_consumer = SQSConsumer(
             queue_url=config.sqs_queue_url,
@@ -256,23 +256,24 @@ async def main() -> None:
             visibility_timeout=config.sqs_visibility_timeout,
             endpoint_url=config.aws_endpoint_url,
         )
+        await sqs_consumer.start()
         logger.debug("sqs_consumer_initialized")
     except Exception as e:
         logger.error("sqs_consumer_init_failed", error=str(e))
         await db_manager.pool.close()
         sys.exit(1)
-    
+
     # 6. Create event processor
     processor = EventProcessor(matcher, db_manager, instruments=instr)
     logger.debug("event_processor_initialized")
-    
+
     # 7. Configure signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     # 8. Start workers
     logger.debug("starting_workers")
-    
+
     tasks = [
         asyncio.create_task(process_messages_loop(sqs_consumer, processor)),
         asyncio.create_task(listen_audit_points_changes(matcher, db_manager)),
@@ -289,7 +290,7 @@ async def main() -> None:
 
     # 9. Wait for shutdown
     await shutdown_event.wait()
-    
+
     # 10. Shutdown gracefully
     logger.debug("shutting_down")
 
@@ -297,6 +298,8 @@ async def main() -> None:
         task.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    await sqs_consumer.stop()
 
     shutdown_metrics()
 

@@ -1,11 +1,12 @@
 """
 Database Manager - Asynchronous PostgreSQL operations management
 """
-from typing import List, Optional, Tuple
 import json
 import asyncio
 import asyncpg
 import time
+from collections.abc import Callable, Coroutine
+from typing import Any
 from models import AuditPoint, S3Event
 import structlog
 
@@ -50,7 +51,7 @@ class DatabaseManager:
         logger.debug("db_pool_created")
         return cls(pool)
 
-    async def load_audit_points(self) -> List[AuditPoint]:
+    async def load_audit_points(self) -> list[AuditPoint]:
         """
         Loads all non-deleted audit points from the database.
 
@@ -81,7 +82,7 @@ class DatabaseManager:
         logger.debug("audit_points_loaded_from_db", count=len(audit_points))
         return audit_points
 
-    async def insert_events_batch(self, events: List[S3Event]) -> Tuple[int, float]:
+    async def insert_events_batch(self, events: list[S3Event]) -> tuple[int, float]:
         """
         Inserts a batch of S3 events with their audit point IDs.
         Uses ON CONFLICT DO NOTHING for idempotence (restart / SQS replay without duplicates).
@@ -97,7 +98,7 @@ class DatabaseManager:
 
         n_cols = 7  # event_time, event_name, bucket, object_key, size, version_id, audit_point_ids
         placeholders = []
-        args: List[object] = []
+        args: list[object] = []
         for i, event in enumerate(events):
             base = i * n_cols
             placeholders.append(
@@ -120,10 +121,11 @@ class DatabaseManager:
         )
 
         async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                start_time = time.perf_counter()
-                await conn.execute(query, *args)
-                db_time = time.perf_counter() - start_time
+            # No explicit transaction needed: INSERT ... ON CONFLICT DO NOTHING is
+            # atomic as a single statement in PostgreSQL and carries an implicit transaction.
+            start_time = time.perf_counter()
+            await conn.execute(query, *args)
+            db_time = time.perf_counter() - start_time
 
         total_associations = sum(len(e.audit_point_ids) for e in events)
         logger.debug(
@@ -155,7 +157,7 @@ class AuditPointsListener:
     Listens to PostgreSQL LISTEN/NOTIFY notifications for audit point changes.
     """
 
-    def __init__(self, db_manager: DatabaseManager, on_change_callback):
+    def __init__(self, db_manager: DatabaseManager, on_change_callback: Callable[[], Coroutine[Any, Any, None]]):
         """
         Initializes the listener.
 
@@ -165,9 +167,12 @@ class AuditPointsListener:
         """
         self.db_manager = db_manager
         self.on_change_callback = on_change_callback
-        self.conn: Optional[asyncpg.Connection] = None
+        self._conn: asyncpg.Connection | None = None
         self._listening = False
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Keeps strong references to in-flight tasks to prevent garbage collection
+        # before completion (required since Python 3.12).
+        self._pending_tasks: set[asyncio.Task[None]] = set()
 
     async def start_listening(self) -> None:
         """
@@ -178,10 +183,10 @@ class AuditPointsListener:
             self._loop = asyncio.get_running_loop()
 
             # Acquire a dedicated connection for LISTEN
-            self.conn = await self.db_manager.pool.acquire()
+            self._conn = await self.db_manager.pool.acquire()
 
             # Set callback for notifications
-            await self.conn.add_listener('audit_points_changed', self._handle_notification)
+            await self._conn.add_listener('audit_points_changed', self._handle_notification)
 
             self._listening = True
             logger.debug("audit_points_listener_started", channel="audit_points_changed")
@@ -194,10 +199,10 @@ class AuditPointsListener:
         """
         Stops listening for notifications.
         """
-        if self.conn and self._listening:
+        if self._conn and self._listening:
             try:
-                await self.conn.remove_listener('audit_points_changed', self._handle_notification)
-                await self.db_manager.pool.release(self.conn)
+                await self._conn.remove_listener('audit_points_changed', self._handle_notification)
+                await self.db_manager.pool.release(self._conn)
                 self._listening = False
                 self._loop = None
                 logger.debug("audit_points_listener_stopped")
@@ -208,6 +213,10 @@ class AuditPointsListener:
         """
         Synchronous handler called by asyncpg on notification.
         Schedules the async callback safely via the captured event loop.
+
+        A strong reference to each created task is kept in `_pending_tasks` until
+        completion, preventing the garbage collector from destroying the task before
+        it runs (Python 3.12+ requirement).
 
         Args:
             connection: PostgreSQL connection
@@ -230,11 +239,13 @@ class AuditPointsListener:
                 prefix=prefix
             )
 
-            # Schedule the async callback safely using the loop captured at start_listening()
             if self._loop and self._loop.is_running() and not self._loop.is_closed():
-                self._loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(self.on_change_callback())
-                )
+                def _schedule():
+                    task = asyncio.create_task(self.on_change_callback())
+                    self._pending_tasks.add(task)
+                    task.add_done_callback(self._pending_tasks.discard)
+
+                self._loop.call_soon_threadsafe(_schedule)
 
         except Exception as e:
             logger.error("notification_handler_error", error=str(e), payload=payload)

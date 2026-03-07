@@ -1,9 +1,9 @@
 """
 Centralized configuration for S3 Event Processor
 """
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root (where config.py and .env live) so .env is loaded regardless of CWD
@@ -15,9 +15,9 @@ class Config(BaseSettings):
 
     # AWS Configuration
     aws_region: str
-    aws_access_key_id: Optional[str] = None           # Optional if using IAM role
-    aws_secret_access_key: Optional[SecretStr] = None  # Optional if using IAM role
-    aws_endpoint_url: Optional[str] = None             # Optional, e.g. http://localhost:4566 for LocalStack
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: SecretStr | None = None
+    aws_endpoint_url: str | None = None
     sqs_queue_url: str
 
     # PostgreSQL Configuration
@@ -38,12 +38,12 @@ class Config(BaseSettings):
     log_level: str
 
     # OpenTelemetry OTLP (optional)
-    otlp_endpoint: Optional[str] = None  # e.g. http://otel-collector:4317
+    otlp_endpoint: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
-        case_sensitive=False
+        case_sensitive=True,
     )
 
     @field_validator("sqs_batch_size")
@@ -77,10 +77,19 @@ class Config(BaseSettings):
 
     @field_validator("otlp_endpoint")
     @classmethod
-    def validate_otlp_endpoint(cls, v: Optional[str]) -> Optional[str]:
+    def validate_otlp_endpoint(cls, v: str | None) -> str | None:
         if v is not None and not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError(f"otlp_endpoint must start with http:// or https://: {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def validate_pool_sizes(self) -> "Config":
+        if self.db_pool_min_size > self.db_pool_max_size:
+            raise ValueError(
+                f"db_pool_min_size ({self.db_pool_min_size}) "
+                f"must be <= db_pool_max_size ({self.db_pool_max_size})"
+            )
+        return self
 
     def get_db_dsn(self) -> str:
         """Returns PostgreSQL DSN for asyncpg"""
@@ -90,6 +99,8 @@ class Config(BaseSettings):
         )
 
 
+@lru_cache(maxsize=1)
 def load_config() -> Config:
-    """Loads and returns a Config instance from environment variables"""
+    """Loads and returns a Config instance from environment variables.
+    Result is cached — subsequent calls return the same instance."""
     return Config()

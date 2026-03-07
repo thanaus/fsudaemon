@@ -12,10 +12,21 @@
 - **Design asynchrone cohérent** : l'utilisation d'`asyncio` + `aioboto3` + `asyncpg` est pertinente et cohérente pour un service I/O-bound à fort débit. Pas de mélange sync/async problématique.
 - **Pattern LISTEN/NOTIFY PostgreSQL** : élégant pour propager les changements d'audit points en temps réel sans polling ni redémarrage. C'est une vraie bonne idée d'architecture.
 - **Hiérarchie de préfixes** : le matching multi-niveaux (`/data`, `/data/2024`, `/data/2024/dir1`) avec retour de tous les IDs correspondants est un design solide qui évite les duplications en base.
+- **Rechargement atomique des audit points** : dans `load_audit_points`, la nouvelle structure est entièrement construite avant d'être assignée en une seule opération à `self.audit_points`. Un consommateur concurrent ne verra jamais d'état intermédiaire vide lors d'un rechargement à chaud.
+- **Normalisation des préfixes** : le suffixe `/` est ajouté automatiquement si absent, sauf pour le préfixe vide (qui signifie "tout le bucket"), ce qui garantit la cohérence du `startswith` dans le matching.
+- **Validation explicite des données** : bucket vide et prefix `None` lèvent une `ValueError` avec un message incluant l'`id` fautif, ce qui facilite le diagnostic en production.
 - **Idempotence** : l'index `UNIQUE (bucket, object_key, event_time, event_name)` avec `ON CONFLICT DO NOTHING` protège contre les rejeux SQS sans logique applicative complexe.
 - **Graceful shutdown** : gestion correcte des signaux `SIGINT`/`SIGTERM`, annulation des tâches asyncio, flush des métriques avant fermeture.
+- **Fiabilité de la file de messages** : en cas d'erreur lors du traitement, le message SQS n'est pas acquitté et réapparaît automatiquement dans la queue pour être retraité. Aucun événement ne peut être perdu silencieusement.
 - **Configuration centralisée** : usage de `pydantic-settings` sans singleton global, `load_config()` retourne directement une instance `Config()`. La racine du projet est détectée dynamiquement via `Path(__file__)`, ce qui évite les problèmes de CWD.
+- **`SecretStr` pour les données sensibles** : `db_password` et `aws_secret_access_key` sont typés `SecretStr`, ce qui évite leur affichage accidentel dans les logs ou les tracebacks (repr masqué automatiquement par pydantic).
+- **Validators explicites sur tous les paramètres critiques** : plages valides et messages d'erreur clairs sur `sqs_batch_size`, `sqs_wait_time_seconds`, `sqs_visibility_timeout`, `log_level` et `otlp_endpoint`. Une mauvaise configuration est rejetée dès le démarrage.
+- **`get_db_dsn()` encapsulé** : le DSN est construit via `get_secret_value()`, le mot de passe ne transite jamais comme `str` brut à l'extérieur de la classe.
 - **Injection de dépendance pour les instruments OTel** : `instruments` est passé en paramètre à `SQSConsumer` et `EventProcessor`, évitant toute dépendance globale implicite.
+- **Client SQS persistant** : le client HTTP est ouvert une seule fois au démarrage via `start()` et fermé proprement au shutdown via `stop()`. Pas de reconnexion TLS à chaque batch, ce qui réduit la latence et le CPU à fort débit.
+- **Pattern factory async `DatabaseManager.create()`** : impossible d'appeler `__init__` directement avec une coroutine — ce pattern est la bonne pratique pour les classes nécessitant une initialisation asynchrone.
+- **`max_inactive_connection_lifetime=300`** : les connexions inactives sont recyclées après 5 min, évitant les connexions zombies côté PostgreSQL. Paramètre de production souvent oublié.
+- **`time.perf_counter()` ciblé sur `conn.execute`** : mesure le temps DB pur sans inclure l'acquisition de connexion depuis le pool — métrique précise et exploitable.
 
 ### Base de données
 
@@ -46,12 +57,24 @@
 - **Pas de `.gitignore` visible** : le fichier `.env` (avec credentials) pourrait être commité accidentellement. Un `.gitignore` explicite avec `.env` est indispensable.
 - **`docker-compose.yml` expose le port PostgreSQL** (`${DB_PORT}:5432`) sur toutes les interfaces par défaut. En production, il vaudrait mieux le restreindre à `127.0.0.1:${DB_PORT}:5432`.
 
+### `db_manager.py` — Qualité du code
+
+Aucun point négatif — les corrections suivantes ont été appliquées : imports `typing` obsolètes remplacés par les built-ins natifs et `collections.abc`, `on_change_callback` typé `Callable[[], Coroutine[Any, Any, None]]`, `self.conn` renommé `self._conn`, `_pending_tasks` paramétré en `set[asyncio.Task[None]]`, transaction explicite supprimée avec commentaire explicatif, et `tools/db_inject.py` + `tools/changelist.py` mis à jour pour utiliser `DatabaseManager.create()` directement à la place de l'import `create_db_pool` inexistant.
+
+### `config.py` — Qualité du code
+
+Aucun point négatif — les corrections suivantes ont été appliquées : `Optional` remplacé par `str | None` (Python 3.10+), `case_sensitive=True` pour cohérence avec Linux, `@model_validator` ajouté pour la validation croisée `db_pool_min_size`/`db_pool_max_size`, et `@lru_cache(maxsize=1)` sur `load_config()` pour garantir une instance unique.
+
 ### Robustesse & Gestion d'erreurs
 
-- **`insert_events_batch` : pas de retry** — si l'insert échoue (réseau, dépassement de pool), l'exception remonte mais le message SQS sera quand même supprimé si d'autres erreurs n'ont pas été détectées au niveau du `process_message`. Il faudrait distinguer les erreurs transientes (retry) des erreurs définitives (dead-letter queue).
-- **Pas de Dead Letter Queue (DLQ)** mentionnée dans l'architecture : en production AWS SQS, une DLQ est essentielle pour capturer les messages qui ne peuvent pas être traités après N tentatives.
+- **Pas de retry sur `insert_events_batch`** : si l'insert échoue de manière transitoire (pic de connexions, timeout réseau), l'exception remonte correctement et le message SQS n'est pas supprimé (il réapparaîtra après le `VisibilityTimeout`). Cependant, l'absence de retry applicatif avec backoff exponentiel signifie que chaque erreur DB consomme inutilement un cycle de visibilité SQS complet (jusqu'à 30 secondes par défaut).
+- **Pas de Dead Letter Queue (DLQ)** mentionnée dans l'architecture : en production AWS SQS, une DLQ est essentielle pour capturer les messages qui ne peuvent pas être traités après N tentatives, et éviter qu'ils bloquent la queue indéfiniment.
 - **Pas de circuit breaker** sur les appels PostgreSQL ou SQS : si la base est saturée, le service peut accumuler des erreurs et le backoff exponentiel seul ne suffit pas toujours.
-- **`consecutive_errors` se réinitialise à 0 dès qu'un batch réussit** : une erreur intermittente toutes les 5 opérations ne sera jamais détectée comme problème persistant.
+- **`consecutive_errors` se réinitialise à 0 dès qu'un batch réussit** : une erreur intermittente toutes les 5 opérations ne sera jamais détectée comme problème persistant. Ce mécanisme protège contre les pannes franches, mais pas contre la dégradation progressive.
+
+### `AuditPointMatcher` — Qualité du code
+
+- **Complexité O(n) dans `get_matching_audit_points`** : la boucle itère sur tous les préfixes du bucket à chaque événement. Négligeable avec peu d'audit points, mais dès quelques milliers de préfixes par bucket, une structure de type trie ou une liste triée avec `bisect` serait significativement plus performante. Ce point rejoint la limite mentionnée sur les >100k audit points en mémoire.
 
 ### Performance & Scalabilité
 
@@ -81,19 +104,19 @@
 
 ## Résumé
 
-| Dimension | Évaluation |
-|---|---|
-| Architecture | ⭐⭐⭐⭐⭐ Excellente |
-| Performance | ⭐⭐⭐⭐ Bonne (COPY FROM non applicable avec ON CONFLICT) |
-| Sécurité | ⭐⭐⭐ Correcte pour dev, insuffisante pour prod |
-| Robustesse | ⭐⭐⭐⭐ Bonne, manque DLQ et retry fin |
-| Observabilité | ⭐⭐⭐⭐ Bonne (OTLP optionnel + DELTA natif) |
-| Tests | ⭐ Absent — point critique |
-| Qualité code | ⭐⭐⭐⭐⭐ Excellente |
-| Documentation | ⭐⭐⭐⭐⭐ Excellente |
+| Dimension | Évaluation | Notes |
+|---|---|---|
+| Architecture | ⭐⭐⭐⭐⭐ | Excellente |
+| Performance | ⭐⭐⭐⭐ | Bonne (COPY FROM non applicable avec ON CONFLICT) |
+| Sécurité | ⭐⭐⭐ | Correcte pour dev, insuffisante pour prod |
+| Robustesse | ⭐⭐⭐⭐ | Bonne, manque DLQ et retry fin sur les erreurs DB transitoires |
+| Observabilité | ⭐⭐⭐⭐ | Bonne (OTLP optionnel + DELTA natif), manque healthcheck HTTP |
+| Tests | ⭐ | Absent — point critique |
+| Qualité code | ⭐⭐⭐⭐⭐ | Excellente |
+| Documentation | ⭐⭐⭐⭐⭐ | Excellente |
 
-**Conclusion** : FSU est un projet de très bonne facture avec une architecture bien pensée, particulièrement le pattern LISTEN/NOTIFY, le matching hiérarchique et l'instrumentation OTel. Les lacunes principales pour une mise en production sérieuse en 2026 sont l'absence totale de tests automatisés, la gestion des secrets, et la nécessité d'un endpoint de healthcheck exposable. Ces points sont corrigibles sans remettre en question l'architecture générale, qui reste excellente.
+**Conclusion** : FSU est un projet de très bonne facture avec une architecture bien pensée, particulièrement le pattern LISTEN/NOTIFY, le matching hiérarchique et l'instrumentation OTel. Les lacunes principales pour une mise en production sérieuse en 2026 sont : l'absence totale de tests automatisés, la gestion des secrets, et l'absence d'un endpoint de healthcheck exposable. Ces points sont tous corrigibles sans remettre en question l'architecture générale, qui reste excellente.
 
 ---
 
-*Analyse rédigée en mars 2026.*
+*Analyse révisée en mars 2026.*

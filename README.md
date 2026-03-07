@@ -52,7 +52,7 @@ FSU is an asynchronous Python service that:
        │
        ▼
 ┌─────────────────────────────────────────────┐
-│               PostgreSQL 17                 │
+│               PostgreSQL 18                 │
 │  - s3_events table                          │
 │  - audit_points table                       │
 │  - GIN index on audit_point_ids[]           │
@@ -89,8 +89,11 @@ source .venv/bin/activate  # Linux/Mac
 
 ```bash
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e .        # base dependencies
+pip install -e ".[dev]" # + dev dependencies (pytest, ruff, mypy)
 ```
+
+> `pyproject.toml` is the single source of truth for dependencies. There is no `requirements.txt`.
 
 4. **Configure environment**
 
@@ -434,6 +437,15 @@ python tools/db_inject.py --bucket my-bucket --events 50000 --batch-size 500
 
 ## ❓ FAQ
 
+### How do I install dependencies?
+
+```bash
+pip install -e .        # base dependencies
+pip install -e ".[dev]" # + dev dependencies (pytest, ruff, mypy)
+```
+
+`pyproject.toml` is the single source of truth for all dependencies. The `-e` flag installs the package in editable mode, so local changes are reflected immediately without reinstalling.
+
 ### How do I connect to the PostgreSQL database running in Docker?
 
 ```bash
@@ -508,8 +520,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
 
 COPY . .
 

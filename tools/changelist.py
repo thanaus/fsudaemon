@@ -14,7 +14,7 @@ from structlog.stdlib import LoggerFactory
 import logging
 
 from config import load_config
-from db_manager import create_db_pool
+from db_manager import DatabaseManager
 
 # Configure standard Python logging (same as main.py / other tools)
 logging.basicConfig(
@@ -49,14 +49,14 @@ async def run_changelist(audit_point_id: int, audit_point_end: int, batch_size: 
     (keyset pagination, batch_size per page).
     """
     config = load_config()
-    pool = await create_db_pool(
+    db = await DatabaseManager.create(
         config.get_db_dsn(),
         min_size=1,
         max_size=2,
     )
 
     try:
-        async with pool.acquire() as conn:
+        async with db.pool.acquire() as conn:
             limit_date = await conn.fetchval(
                 "SELECT created_at FROM audit_points WHERE id = $1",
                 audit_point_end,
@@ -120,7 +120,7 @@ async def run_changelist(audit_point_id: int, audit_point_end: int, batch_size: 
             logger.info("changelist_done", total_events=total)
 
     finally:
-        await pool.close()
+        await db.pool.close()
 
 
 def main() -> None:

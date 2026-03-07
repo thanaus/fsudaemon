@@ -16,7 +16,7 @@ from structlog.stdlib import LoggerFactory
 import logging
 
 from config import load_config
-from db_manager import create_db_pool, DatabaseManager
+from db_manager import DatabaseManager
 from audit_matcher import AuditPointMatcher
 from models import S3Event
 
@@ -121,12 +121,11 @@ def dicts_to_s3_events(
 async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
     """Load config, create pool and matcher, generate events and insert them into the DB."""
     config = load_config()
-    pool = await create_db_pool(
+    db = await DatabaseManager.create(
         config.get_db_dsn(),
         min_size=1,
         max_size=min(10, batch_size // 100 + 2),
     )
-    db = DatabaseManager(pool)
 
     try:
         audit_points = await db.load_audit_points()
@@ -160,7 +159,7 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
             events_per_second=round(total_inserted / total_time, 2) if total_time > 0 else 0,
         )
     finally:
-        await pool.close()
+        await db.pool.close()
 
 
 def main() -> None:
