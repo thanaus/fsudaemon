@@ -14,12 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import logging
 import boto3
 from botocore.exceptions import ClientError
-from config import load_config
+from config import load_config, Config
 import structlog
 from structlog.stdlib import LoggerFactory
-
-logger = structlog.get_logger(__name__)
-
+from structlog.types import FilteringBoundLogger
 
 def generate_s3_events(bucket: str, num_events: int) -> list[dict]:
     """
@@ -65,7 +63,7 @@ def generate_s3_events(bucket: str, num_events: int) -> list[dict]:
     return events
 
 
-def send_to_sqs(queue_url: str, messages: list[str], sqs_client) -> tuple[int, int]:
+def send_to_sqs(queue_url: str, messages: list[str], sqs_client, logger: FilteringBoundLogger | None = None) -> tuple[int, int]:
     """
     Send messages to SQS using batch API.
 
@@ -73,10 +71,12 @@ def send_to_sqs(queue_url: str, messages: list[str], sqs_client) -> tuple[int, i
         queue_url: SQS queue URL
         messages: List of message bodies (JSON strings)
         sqs_client: boto3 SQS client
+        logger: Injected structlog logger. Defaults to a module-level logger if None.
 
     Returns:
         Tuple of (sent_count, failed_count)
     """
+    log = logger or structlog.get_logger(__name__)
     sent_count: int = 0
     failed_count: int = 0
 
@@ -101,7 +101,7 @@ def send_to_sqs(queue_url: str, messages: list[str], sqs_client) -> tuple[int, i
             failed_count += failed
 
             if failed > 0:
-                logger.warning(
+                log.warning(
                     "batch_send_partial_failure",
                     successful=successful,
                     failed=failed,
@@ -109,7 +109,7 @@ def send_to_sqs(queue_url: str, messages: list[str], sqs_client) -> tuple[int, i
                 )
 
         except ClientError as e:
-            logger.error(
+            log.error(
                 "batch_send_error",
                 error=str(e),
                 batch_size=len(batch),
@@ -144,8 +144,69 @@ def _setup_logging() -> None:
     )
 
 
+def run_ingest(config: Config, bucket: str, messages: int, events_per_message: int, logger: FilteringBoundLogger | None = None) -> None:
+    """Create SQS client, generate events and send them to the queue.
+
+    Args:
+        config: Application configuration (injected, not loaded internally).
+        bucket: S3 bucket name for generated events.
+        messages: Number of SQS messages to send.
+        events_per_message: Number of S3 events per SQS message.
+        logger: Injected structlog logger. Defaults to a module-level logger if None.
+    """
+    log = logger or structlog.get_logger(__name__)
+
+    total_events = messages * events_per_message
+    log.info(
+        "sqs_ingest_started",
+        bucket=bucket,
+        messages_to_send=messages,
+        events_per_message=events_per_message,
+        total_events=total_events,
+    )
+
+    client_kw: dict = {"region_name": config.aws_region}
+    if config.aws_access_key_id:
+        client_kw["aws_access_key_id"] = config.aws_access_key_id.get_secret_value()
+    if config.aws_secret_access_key:
+        client_kw["aws_secret_access_key"] = config.aws_secret_access_key.get_secret_value()
+    if config.aws_endpoint_url:
+        client_kw["endpoint_url"] = config.aws_endpoint_url
+
+    sqs = boto3.client("sqs", **client_kw)
+    log.info("sqs_client_created", queue_url=config.sqs_queue_url)
+
+    log.info("generating_events", total=total_events)
+    all_events = generate_s3_events(bucket, total_events)
+    log.info("events_generated", count=len(all_events))
+
+    msg_list: list[str] = [
+        json.dumps({'Records': all_events[i * events_per_message : (i + 1) * events_per_message]})
+        for i in range(messages)
+    ]
+    log.info("messages_prepared", count=len(msg_list))
+
+    log.info("sending_to_sqs", queue_url=config.sqs_queue_url)
+    sent_count, failed_count = send_to_sqs(config.sqs_queue_url, msg_list, sqs, logger=log)
+
+    log.info(
+        "sqs_ingest_complete",
+        messages_sent=sent_count,
+        messages_failed=failed_count,
+        total_events_sent=sent_count * events_per_message,
+        success_rate=round(sent_count / messages * 100, 2) if messages > 0 else 0,
+    )
+
+    if failed_count > 0:
+        log.warning("some_messages_failed", failed=failed_count)
+        sys.exit(1)
+
+    log.info("all_messages_sent_successfully")
+
+
 def main() -> None:
     _setup_logging()
+    log = structlog.get_logger(__name__)
 
     parser = argparse.ArgumentParser(
         description="Inject test S3 events into SQS queue",
@@ -167,64 +228,16 @@ Examples:
     args = parser.parse_args()
 
     if args.messages <= 0:
-        logger.error("error", message="--messages must be > 0")
+        log.error("error", message="--messages must be > 0")
         sys.exit(1)
     if args.events_per_message <= 0 or args.events_per_message > 100:
-        logger.error("error", message="--events-per-message must be between 1 and 100")
+        log.error("error", message="--events-per-message must be between 1 and 100")
         sys.exit(1)
 
-    total_events = args.messages * args.events_per_message
-    logger.info(
-        "sqs_ingest_started",
-        bucket=args.bucket,
-        messages_to_send=args.messages,
-        events_per_message=args.events_per_message,
-        total_events=total_events,
-    )
-
     try:
-        config = load_config()
-
-        client_kw: dict = {"region_name": config.aws_region}
-        if config.aws_access_key_id:
-            client_kw["aws_access_key_id"] = config.aws_access_key_id.get_secret_value()
-        if config.aws_secret_access_key:
-            client_kw["aws_secret_access_key"] = config.aws_secret_access_key.get_secret_value()
-        if config.aws_endpoint_url:
-            client_kw["endpoint_url"] = config.aws_endpoint_url
-
-        sqs = boto3.client("sqs", **client_kw)
-        logger.info("sqs_client_created", queue_url=config.sqs_queue_url)
-
-        logger.info("generating_events", total=total_events)
-        all_events = generate_s3_events(args.bucket, total_events)
-        logger.info("events_generated", count=len(all_events))
-
-        messages: list[str] = [
-            json.dumps({'Records': all_events[i * args.events_per_message : (i + 1) * args.events_per_message]})
-            for i in range(args.messages)
-        ]
-        logger.info("messages_prepared", count=len(messages))
-
-        logger.info("sending_to_sqs", queue_url=config.sqs_queue_url)
-        sent_count, failed_count = send_to_sqs(config.sqs_queue_url, messages, sqs)
-
-        logger.info(
-            "sqs_ingest_complete",
-            messages_sent=sent_count,
-            messages_failed=failed_count,
-            total_events_sent=sent_count * args.events_per_message,
-            success_rate=round(sent_count / args.messages * 100, 2) if args.messages > 0 else 0,
-        )
-
-        if failed_count > 0:
-            logger.warning("some_messages_failed", failed=failed_count)
-            sys.exit(1)
-
-        logger.info("all_messages_sent_successfully")
-
+        run_ingest(load_config(), args.bucket, args.messages, args.events_per_message, logger=log)
     except Exception as e:
-        logger.error("sqs_ingest_failed", error=str(e))
+        log.error("sqs_ingest_failed", error=str(e))
         sys.exit(1)
 
 

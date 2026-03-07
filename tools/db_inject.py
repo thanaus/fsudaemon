@@ -13,15 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import structlog
 from structlog.stdlib import LoggerFactory
+from structlog.types import FilteringBoundLogger
 import logging
 
-from config import load_config
+from config import load_config, Config
 from db_manager import DatabaseManager
 from audit_matcher import AuditPointMatcher
 from models import S3Event
-
-logger = structlog.get_logger(__name__)
-
 
 def generate_s3_event_dicts(bucket: str, num_events: int) -> list[dict]:
     """
@@ -94,9 +92,9 @@ def dicts_to_s3_events(
     return out
 
 
-async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
-    """Load config, create pool and matcher, generate events and insert them into the DB."""
-    config = load_config()
+async def run_inject(config: Config, bucket: str, num_events: int, batch_size: int, logger: FilteringBoundLogger | None = None) -> None:
+    """Create pool and matcher, generate events and insert them into the DB."""
+    log = logger or structlog.get_logger(__name__)
     db = await DatabaseManager.create(
         config.get_db_dsn(),
         min_size=config.db_pool_min_size,
@@ -106,9 +104,9 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
     try:
         audit_points = await db.load_audit_points()
         matcher = AuditPointMatcher(audit_points)
-        logger.info("audit_points_loaded", count=len(audit_points))
+        log.info("audit_points_loaded", count=len(audit_points))
 
-        logger.info("generating_events", bucket=bucket, num_events=num_events)
+        log.info("generating_events", bucket=bucket, num_events=num_events)
         event_dicts = generate_s3_event_dicts(bucket, num_events)
         s3_events = dicts_to_s3_events(event_dicts, matcher)
 
@@ -116,7 +114,7 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
         total_time: float = 0.0
         batches: int = 0
 
-        logger.info("db_inject_insert_start", total_events=len(s3_events), batch_size=batch_size)
+        log.info("db_inject_insert_start", total_events=len(s3_events), batch_size=batch_size)
         for i in range(0, len(s3_events), batch_size):
             batch = s3_events[i : i + batch_size]
             n, elapsed = await db.insert_events_batch(batch)
@@ -124,7 +122,7 @@ async def run_inject(bucket: str, num_events: int, batch_size: int) -> None:
             total_time += elapsed
             batches += 1
 
-        logger.info(
+        log.info(
             "db_inject_complete",
             bucket=bucket,
             events_requested=num_events,
@@ -165,6 +163,7 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
+    log = structlog.get_logger(__name__)
 
     parser = argparse.ArgumentParser(
         description="Inject S3 events directly into the DB for benchmarks (no SQS)",
@@ -186,16 +185,16 @@ Examples:
     args = parser.parse_args()
 
     if args.events <= 0:
-        logger.error("error", message="--events must be > 0")
+        log.error("error", message="--events must be > 0")
         sys.exit(1)
     if args.batch_size <= 0 or args.batch_size > 10_000:
-        logger.error("error", message="--batch-size must be between 1 and 10000")
+        log.error("error", message="--batch-size must be between 1 and 10000")
         sys.exit(1)
 
     try:
-        asyncio.run(run_inject(args.bucket, args.events, args.batch_size))
+        asyncio.run(run_inject(load_config(), args.bucket, args.events, args.batch_size, logger=log))
     except Exception as e:
-        logger.error("db_inject_failed", error=str(e))
+        log.error("db_inject_failed", error=str(e))
         sys.exit(1)
 
 

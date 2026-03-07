@@ -5,9 +5,8 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Sequence
 
 # Add parent directory to PYTHONPATH so config is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,14 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import asyncpg
 import structlog
 from structlog.stdlib import LoggerFactory
+from structlog.types import FilteringBoundLogger
 
-from config import load_config
+from config import Config, load_config
 from db_manager import DatabaseManager
 
-logger = structlog.get_logger(__name__)
-
 # Type alias for the batch handler: receives a list of rows, returns nothing.
-BatchHandler = Callable[[Sequence[asyncpg.Record]], Awaitable[None]]
+type BatchHandler = Callable[[Sequence[asyncpg.Record]], Awaitable[None]]
 
 
 async def _noop_handler(rows: Sequence[asyncpg.Record]) -> None:
@@ -31,23 +29,27 @@ async def _noop_handler(rows: Sequence[asyncpg.Record]) -> None:
 
 
 async def run_changelist(
+    config: Config,
     audit_point_id: int,
     audit_point_end: int,
     batch_size: int,
     row_handler: BatchHandler = _noop_handler,
+    logger: FilteringBoundLogger | None = None,
 ) -> None:
     """
     Fetch events for audit_point_id received before audit_point_end was created
     (keyset pagination, batch_size per page).
 
     Args:
+        config: Application configuration (injected, not loaded internally).
         audit_point_id: First audit point ID (events that contain this audit point).
         audit_point_end: Second audit point ID (events received before its creation date).
         batch_size: Number of rows to fetch per page.
         row_handler: Async callable invoked with each batch of rows.
                      Defaults to a no-op. Replace to write, transform, forward, etc.
+        logger: Injected structlog logger. Defaults to a module-level logger if None.
     """
-    config = load_config()
+    log = logger or structlog.get_logger(__name__)
     db = await DatabaseManager.create(
         config.get_db_dsn(),
         min_size=config.db_pool_min_size,
@@ -61,7 +63,7 @@ async def run_changelist(
                 audit_point_id,
             )
             if start_date is None:
-                logger.error("audit_point_not_found", id=audit_point_id)
+                log.error("audit_point_not_found", id=audit_point_id)
                 return
 
             limit_date = await conn.fetchval(
@@ -69,11 +71,11 @@ async def run_changelist(
                 audit_point_end,
             )
             if limit_date is None:
-                logger.error("audit_point_not_found", id=audit_point_end)
+                log.error("audit_point_not_found", id=audit_point_end)
                 return
 
             if limit_date <= start_date:
-                logger.error(
+                log.error(
                     "audit_points_inverted",
                     audit_point_id=audit_point_id,
                     audit_point_end=audit_point_end,
@@ -83,7 +85,7 @@ async def run_changelist(
                 )
                 return
 
-            logger.info(
+            log.info(
                 "changelist_start",
                 audit_point_id=audit_point_id,
                 audit_point_end=audit_point_end,
@@ -122,7 +124,7 @@ async def run_changelist(
                 last_id = rows[-1]["id"]
                 total += len(rows)
 
-                logger.info(
+                log.info(
                     "changelist_batch",
                     batch_num=batch_num,
                     last_id=last_id,
@@ -132,7 +134,7 @@ async def run_changelist(
                 if len(rows) < batch_size:
                     break
 
-            logger.info("changelist_done", total_events=total)
+            log.info("changelist_done", total_events=total)
 
     finally:
         await db.pool.close()
@@ -165,6 +167,7 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
+    log = structlog.get_logger(__name__)
 
     parser = argparse.ArgumentParser(
         description="Fetch events between two audit points (keyset pagination)",
@@ -196,20 +199,22 @@ Examples:
     args = parser.parse_args()
 
     if args.batch_size <= 0 or args.batch_size > 100_000:
-        logger.error("error", message="--batch-size must be between 1 and 100000")
+        log.error("error", message="--batch-size must be between 1 and 100000")
         sys.exit(1)
 
     try:
         asyncio.run(
             run_changelist(
+                load_config(),
                 args.audit_point_id,
                 args.audit_point_end,
                 args.batch_size,
+                logger=log,
                 # row_handler defaults to _noop_handler
             )
         )
     except Exception as e:
-        logger.error("changelist_failed", error=str(e))
+        log.error("changelist_failed", error=str(e))
         sys.exit(1)
 
 
