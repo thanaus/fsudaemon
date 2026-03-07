@@ -37,17 +37,26 @@ class AuditPointMatcher:
         Args:
             audit_points: List of audit points to load
         """
-        self.audit_points.clear()
-        
+        new_audit_points: Dict[str, List[Tuple[int, str]]] = {}
+
         for ap in audit_points:
-            if ap.bucket not in self.audit_points:
-                self.audit_points[ap.bucket] = []
-            
-            self.audit_points[ap.bucket].append((ap.id, ap.prefix))
-        
-        # Sort by prefix length (longest first) for optimization
-        for bucket in self.audit_points:
-            self.audit_points[bucket].sort(key=lambda x: len(x[1]), reverse=True)
+            if not ap.bucket:
+                raise ValueError(f"AuditPoint id={ap.id} has an invalid bucket: {ap.bucket!r}")
+            if ap.prefix is None:
+                raise ValueError(f"AuditPoint id={ap.id} has a None prefix")
+
+            if ap.bucket not in new_audit_points:
+                new_audit_points[ap.bucket] = []
+
+            # Normalize prefix: ensure it ends with '/' unless empty (empty = match entire bucket)
+            prefix = ap.prefix
+            if prefix and not prefix.endswith("/"):
+                prefix += "/"
+
+            new_audit_points[ap.bucket].append((ap.id, prefix))
+
+        # Atomic assignment — no intermediate empty state visible to concurrent readers
+        self.audit_points = new_audit_points
         
         self._total_audit_points = len(audit_points)
         
@@ -85,19 +94,6 @@ class AuditPointMatcher:
                 matching_ids.append(audit_point_id)
         
         return matching_ids
-    
-    def matches(self, bucket: str, key: str) -> bool:
-        """
-        Returns True if at least one audit point matches.
-        
-        Args:
-            bucket: S3 bucket name
-            key: S3 object key
-        
-        Returns:
-            True if at least one audit point matches
-        """
-        return len(self.get_matching_audit_points(bucket, key)) > 0
     
     def get_stats(self) -> Dict:
         """Returns statistics about loaded audit points"""

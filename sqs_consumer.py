@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Optional
 import aioboto3
 from botocore.exceptions import ClientError
 import structlog
-from telemetry import instruments
 
 logger = structlog.get_logger(__name__)
 
@@ -17,6 +16,7 @@ class SQSConsumer:
     def __init__(
         self,
         queue_url: str,
+        instruments: dict,
         region_name: str = "us-east-1",
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
@@ -30,6 +30,7 @@ class SQSConsumer:
         
         Args:
             queue_url: SQS queue URL
+            instruments: OpenTelemetry instruments dict
             region_name: AWS region
             aws_access_key_id: AWS access key (optional if IAM role)
             aws_secret_access_key: AWS secret key (optional if IAM role)
@@ -39,6 +40,7 @@ class SQSConsumer:
             endpoint_url: Optional SQS endpoint (e.g. http://localhost:4566 for LocalStack)
         """
         self.queue_url = queue_url
+        self.instruments = instruments
         self.region_name = region_name
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
@@ -81,7 +83,7 @@ class SQSConsumer:
                     AttributeNames=['All'],
                     MessageAttributeNames=['All']
                 )
-                instruments()["sqs_receive_message_seconds"].record(time.perf_counter() - start)
+                self.instruments["sqs_receive_message_seconds"].record(time.perf_counter() - start)
 
             messages = response.get('Messages', [])
             
@@ -114,7 +116,6 @@ class SQSConsumer:
         if not receipt_handles:
             return 0
         
-        # SQS limits to 10 messages per batch
         batch_size = 10
         deleted_count = 0
         
@@ -139,7 +140,7 @@ class SQSConsumer:
                         QueueUrl=self.queue_url,
                         Entries=entries
                     )
-                    instruments()["sqs_delete_message_batch_seconds"].record(time.perf_counter() - start)
+                    self.instruments["sqs_delete_message_batch_seconds"].record(time.perf_counter() - start)
 
                     deleted_count += len(response.get('Successful', []))
                     

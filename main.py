@@ -11,11 +11,11 @@ import structlog
 from structlog.stdlib import LoggerFactory
 
 from config import load_config
-from db_manager import create_db_pool, DatabaseManager, AuditPointsListener
+from db_manager import DatabaseManager, AuditPointsListener
 from audit_matcher import AuditPointMatcher
 from sqs_consumer import SQSConsumer
 from event_processor import EventProcessor
-from telemetry import init_metrics, shutdown_metrics
+from telemetry import init_metrics, instruments, shutdown_metrics
 
 # Configure standard Python logging
 logging.basicConfig(
@@ -165,17 +165,14 @@ async def listen_audit_points_changes(
     """
     logger.debug("audit_listen_loop_starting")
     
-    # Create listener with sync callback
     async def on_change():
         await sync_audit_points(matcher, db_manager)
     
     listener = AuditPointsListener(db_manager, on_change)
     
     try:
-        # Start listening
         await listener.start_listening()
         
-        # Infinite loop to keep LISTEN connection active
         while not shutdown_event.is_set():
             await asyncio.sleep(1)
             
@@ -201,32 +198,28 @@ async def main() -> None:
     # 1. Load configuration
     try:
         config = load_config()
-        logger.debug(
-            "configuration_loaded",
-            log_level=config.log_level
-        )
+        logger.debug("configuration_loaded", log_level=config.log_level)
     except Exception as e:
         logger.error("configuration_load_failed", error=str(e))
         sys.exit(1)
 
-    # 2. OpenTelemetry - metrics exported to stdout
-    init_metrics(export_interval_seconds=60)
+    # 2. OpenTelemetry - metrics exported to stdout, optionally to OTLP collector
+    init_metrics(export_interval_seconds=60, otlp_endpoint=config.otlp_endpoint)
+    instr = instruments()
     logger.debug("telemetry_initialized", export="stdout")
 
     # 3. Create PostgreSQL connection pool
     try:
-        db_pool = await create_db_pool(
+        db_manager = await DatabaseManager.create(
             config.get_db_dsn(),
             min_size=config.db_pool_min_size,
             max_size=config.db_pool_max_size
         )
-        db_manager = DatabaseManager(db_pool)
-        
-        # Check connection
+
         if not await db_manager.health_check():
             logger.error("database_health_check_failed")
             sys.exit(1)
-        
+
         logger.debug("database_connection_ok")
     except Exception as e:
         logger.error("database_connection_failed", error=str(e))
@@ -247,30 +240,30 @@ async def main() -> None:
             )
     except Exception as e:
         logger.error("audit_points_load_failed", error=str(e))
-        await db_pool.close()
+        await db_manager.pool.close()
         sys.exit(1)
     
     # 5. Create SQS consumer
     try:
         sqs_consumer = SQSConsumer(
             queue_url=config.sqs_queue_url,
+            instruments=instr,
             region_name=config.aws_region,
             aws_access_key_id=config.aws_access_key_id,
-            aws_secret_access_key=config.aws_secret_access_key,
+            aws_secret_access_key=config.aws_secret_access_key.get_secret_value() if config.aws_secret_access_key else None,
             max_messages=config.sqs_batch_size,
             wait_time_seconds=config.sqs_wait_time_seconds,
             visibility_timeout=config.sqs_visibility_timeout,
             endpoint_url=config.aws_endpoint_url,
         )
-        
         logger.debug("sqs_consumer_initialized")
     except Exception as e:
         logger.error("sqs_consumer_init_failed", error=str(e))
-        await db_pool.close()
+        await db_manager.pool.close()
         sys.exit(1)
     
     # 6. Create event processor
-    processor = EventProcessor(matcher, db_manager)
+    processor = EventProcessor(matcher, db_manager, instruments=instr)
     logger.debug("event_processor_initialized")
     
     # 7. Configure signal handlers
@@ -300,18 +293,14 @@ async def main() -> None:
     # 10. Shutdown gracefully
     logger.debug("shutting_down")
 
-    # Cancel all tasks
     for task in tasks:
         task.cancel()
 
-    # Wait for all tasks to complete
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Final metrics export then OpenTelemetry shutdown
     shutdown_metrics()
 
-    # Close connection pool
-    await db_pool.close()
+    await db_manager.pool.close()
 
     logger.info("shutdown_complete")
 

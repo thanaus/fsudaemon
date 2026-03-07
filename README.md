@@ -45,14 +45,14 @@ FSU is an asynchronous Python service that:
        ▼
 ┌─────────────────────────────────────────────┐
 │          Database Manager (asyncpg)         │
-│  - Batch insert via COPY FROM               │
+│  - Batch insert via multi-row INSERT        │
 │  - Connection pool                          │
 │  - PostgreSQL array support                 │
 └──────┬──────────────────────────────────────┘
        │
        ▼
 ┌─────────────────────────────────────────────┐
-│               PostgreSQL 18                 │
+│               PostgreSQL 17                 │
 │  - s3_events table                          │
 │  - audit_points table                       │
 │  - GIN index on audit_point_ids[]           │
@@ -76,24 +76,23 @@ FSU is an asynchronous Python service that:
 cd fsudaemon
 ```
 
-1. **Create Python virtual environment**
+2. **Create Python virtual environment**
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
 # or
 .\.venv\Scripts\activate  # Windows
-
 ```
 
-1. **Install dependencies**
+3. **Install dependencies**
 
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-1. **Configure environment**
+4. **Configure environment**
 
 Copy `.env.example` to `.env` and configure variables:
 
@@ -129,19 +128,19 @@ LOG_LEVEL=INFO
 LOG_FORMAT=json
 ```
 
-1. **Start PostgreSQL with Docker Compose**
+5. **Start PostgreSQL with Docker Compose**
 
 ```bash
 docker compose up -d
 ```
 
-1. **Initialize database schema**
+6. **Initialize database schema**
 
 ```bash
 python tools/init_db.py
 ```
 
-1. **Run the processor**
+7. **Run the processor**
 
 ```bash
 python main.py
@@ -185,7 +184,7 @@ No restart needed! The PostgreSQL trigger `audit_points_change_trigger` automati
 ### Optimized Performance
 
 - **asyncpg**: Ultra-fast asynchronous PostgreSQL library
-- **COPY FROM**: Optimized batch insertion (much faster than INSERT)
+- **Multi-row INSERT**: Optimized batch insertion (much faster than individual INSERTs). `COPY FROM` would be even faster but does not natively support `ON CONFLICT`.
 - **Connection pool**: Reuse PostgreSQL connections
 - **Long polling SQS**: Reduces AWS API calls
 - **GIN index**: Fast queries on PostgreSQL arrays
@@ -246,6 +245,7 @@ CREATE TABLE s3_events (
 
 - GIN index on `audit_point_ids[]` for fast array queries
 - B-tree indexes on `event_time`, `bucket`, `object_key`, `event_name`, `received_at`
+- UNIQUE index on `(bucket, object_key, event_time, event_name)` for idempotence / SQS replay without duplicates
 
 ### Example Queries
 
@@ -313,8 +313,8 @@ For a fully local setup (no AWS), use **LocalStack** from the `tools/` directory
 | `event_processor.py` | Event processing orchestration                     |
 | `audit_matcher.py`   | Fast event matching against audit points           |
 | `db_manager.py`      | Async PostgreSQL management with asyncpg           |
-| `models.py`          | Data models (AuditPoint, S3Event)                |
-| `telemetry.py`       | OpenTelemetry metrics (export structlog)        |
+| `models.py`          | Data models (AuditPoint, S3Event)                  |
+| `telemetry.py`       | OpenTelemetry metrics (export via structlog)        |
 
 
 ### Tools (`tools/`)
@@ -325,15 +325,17 @@ For a fully local setup (no AWS), use **LocalStack** from the `tools/` directory
 | `tools/init_db.py`    | Database schema initialization script                         |
 | `tools/changelist.py` | Fetch all events between two audit points (keyset pagination) |
 | `tools/sqs_ingest.py` | Manual SQS message ingestion utility                          |
+| `tools/db_inject.py`  | Direct DB insertion for benchmarks (no SQS)                   |
 
 
 ### Async Workers
 
-The processor runs 3 workers in parallel:
+The processor runs 2 workers in parallel:
 
-1. `**process_messages_loop**`: Consumes and processes SQS messages
-2. `**listen_audit_points_changes**`: Listens to PostgreSQL notifications to reload audit points
-3. `**log_stats_loop**`: Displays statistics every 60 seconds
+1. **`process_messages_loop`**: Consumes and processes SQS messages
+2. **`listen_audit_points_changes`**: Listens to PostgreSQL notifications to reload audit points
+
+OpenTelemetry metrics are exported to stdout every 60 seconds via the `StructlogMetricExporter`.
 
 ## 📈 Statistics and Monitoring
 
@@ -398,14 +400,7 @@ Every 60 seconds, the system displays:
 Iterates over all S3 events belonging to an audit point and received before another audit point was created, using **keyset pagination** on the primary key (1024 events per batch).
 
 ```bash
-python tools/changelist.py
-```
-
-Configure the two constants at the top of the file:
-
-```python
-AUDIT_POINT_ID = 1   # Events must belong to this audit point
-AUDIT_POINT_END = 2  # Events received before this audit point was created
+python tools/changelist.py --audit-point-id 1 --audit-point-end 2
 ```
 
 Add your processing logic inside the `for row in rows` loop (write to file, transform, send to API, etc.).
@@ -420,12 +415,21 @@ Creates the `audit_points` and `s3_events` tables, indexes, and the PostgreSQL N
 python tools/init_db.py
 ```
 
-### `tools/sqs_ingest.py` — Manual SQS Ingestion
+### `tools/sqs_ingest.py` — SQS Load Testing
 
-Utility for manually ingesting SQS messages outside the main service loop.
+Generates S3 events and injects them into the configured SQS queue.
 
 ```bash
-python tools/sqs_ingest.py
+python tools/sqs_ingest.py --bucket my-bucket --messages 1000
+```
+
+### `tools/db_inject.py` — Direct DB Benchmark
+
+Inserts S3 events directly into the database, bypassing SQS. Useful for isolating DB insertion performance.
+
+```bash
+python tools/db_inject.py --bucket my-bucket --events 10000
+python tools/db_inject.py --bucket my-bucket --events 50000 --batch-size 500
 ```
 
 ## ❓ FAQ

@@ -1,12 +1,13 @@
 """
-OpenTelemetry metrics - export stats to stdout (single structlog line).
+OpenTelemetry metrics - export stats to stdout (single structlog line) + optional OTLP.
 """
 from typing import Any, Dict, Optional
 
 import structlog
 from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics import MeterProvider, Counter, Histogram
 from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
     MetricExportResult,
     MetricExporter,
     PeriodicExportingMetricReader,
@@ -27,6 +28,13 @@ _METRIC_NAME_TO_KEY = {
     "fsudaemon.sqs_delete_message_batch_seconds": "sqs_delete_message_batch_seconds",
 }
 
+# DELTA temporality for all instrument types — SDK computes deltas natively,
+# no need for manual bookkeeping in the exporter
+_DELTA_TEMPORALITY = {
+    Counter: AggregationTemporality.DELTA,
+    Histogram: AggregationTemporality.DELTA,
+}
+
 
 class StructlogMetricExporter(MetricExporter):
     """
@@ -35,31 +43,15 @@ class StructlogMetricExporter(MetricExporter):
     """
 
     def __init__(self) -> None:
-        super().__init__()
-        self._last: Dict[str, Any] = {}
+        super().__init__(preferred_temporality=_DELTA_TEMPORALITY)
 
     def export(self, metrics_data, timeout_millis: float = 10_000, **kwargs) -> MetricExportResult:
         if metrics_data is None:
             return MetricExportResult.SUCCESS
         try:
-            current = _extract_metrics_payload(metrics_data)
-            if not current:
-                return MetricExportResult.SUCCESS
-            # Delta = activity over last period (not cumulative)
-            delta: Dict[str, Any] = {}
-            for key, value in current.items():
-                prev = self._last.get(key, 0)
-                if isinstance(value, (int, float)):
-                    d = value - (prev if isinstance(prev, (int, float)) else 0)
-                    if isinstance(value, int):
-                        delta[key] = max(0, int(d))
-                    else:
-                        delta[key] = round(max(0.0, float(d)), 2)
-                else:
-                    delta[key] = value
-            self._last = dict(current)
-            if delta:
-                logger.info("processing_stats", **delta)
+            payload = _extract_metrics_payload(metrics_data)
+            if payload:
+                logger.info("processing_stats", **payload)
         except Exception as e:
             logger.warning("metrics_export_error", error=str(e))
         return MetricExportResult.SUCCESS
@@ -84,23 +76,21 @@ def _extract_metrics_payload(metrics_data) -> Dict[str, Any]:
                 data = getattr(metric, "data", None)
                 if data is None:
                     continue
-                # Sum (counter) -> NumberDataPoint.value
                 data_points = getattr(data, "data_points", None) or []
                 if not data_points:
                     continue
                 if hasattr(data_points[0], "value"):
-                    # Counter: sum of values (usually a single point)
                     total = sum(getattr(dp, "value", 0) or 0 for dp in data_points)
                     out[key] = int(total)
                 elif hasattr(data_points[0], "sum"):
-                    # Histogram: sum of durations (sum of data points)
                     total_sum = sum(getattr(dp, "sum", 0) or 0 for dp in data_points)
                     out[key] = round(float(total_sum), 2)
     return out
 
+
 # References for shutdown / flush
 _meter_provider: Optional[MeterProvider] = None
-_metric_reader: Optional[PeriodicExportingMetricReader] = None
+_metric_readers: list = []
 _instruments: Optional[dict] = None
 
 
@@ -108,28 +98,52 @@ def init_metrics(
     service_name: str = "fsudaemon",
     service_version: str = "1.0.0",
     export_interval_seconds: int = 60,
+    otlp_endpoint: Optional[str] = None,
 ) -> None:
     """
-    Configure OpenTelemetry with metrics export to stdout.
+    Configure OpenTelemetry with metrics export to stdout via structlog,
+    and optionally to an OTLP collector.
 
     Args:
         service_name: Service name
         service_version: Service version
         export_interval_seconds: Export interval in seconds (default 60)
+        otlp_endpoint: Optional OTLP gRPC endpoint (e.g. http://otel-collector:4317).
+                       If None, OTLP export is disabled.
     """
-    global _meter_provider, _metric_reader, _instruments
+    global _meter_provider, _metric_readers, _instruments
 
-    exporter = StructlogMetricExporter()
-    _metric_reader = PeriodicExportingMetricReader(
-        exporter,
+    _metric_readers = []
+
+    # Reader 1: structlog stdout (always active)
+    structlog_reader = PeriodicExportingMetricReader(
+        StructlogMetricExporter(),
         export_interval_millis=export_interval_seconds * 1000,
     )
-    _meter_provider = MeterProvider(metric_readers=[_metric_reader])
+    _metric_readers.append(structlog_reader)
+
+    # Reader 2: OTLP (optional, enabled if otlp_endpoint is set)
+    if otlp_endpoint:
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+            otlp_reader = PeriodicExportingMetricReader(
+                OTLPMetricExporter(endpoint=otlp_endpoint),
+                export_interval_millis=export_interval_seconds * 1000,
+            )
+            _metric_readers.append(otlp_reader)
+            logger.info("otlp_metrics_enabled", endpoint=otlp_endpoint)
+        except ImportError:
+            logger.warning(
+                "otlp_exporter_unavailable",
+                message="Install opentelemetry-exporter-otlp-proto-grpc to enable OTLP export",
+                endpoint=otlp_endpoint,
+            )
+
+    _meter_provider = MeterProvider(metric_readers=_metric_readers)
     metrics.set_meter_provider(_meter_provider)
 
     meter = _meter_provider.get_meter(service_name, service_version)
 
-    # Create instruments once
     _instruments = {
         "messages_received": meter.create_counter(
             "fsudaemon.messages_received",
@@ -182,11 +196,11 @@ def instruments() -> Dict[str, Any]:
 
 def shutdown_metrics() -> None:
     """Flush and graceful shutdown of MeterProvider (call on exit)."""
-    global _metric_reader, _meter_provider, _instruments
+    global _metric_readers, _meter_provider, _instruments
     _instruments = None
-    if _metric_reader is not None:
+    for reader in _metric_readers:
         try:
-            _metric_reader.force_flush()
+            reader.force_flush()
         except Exception:
             pass
     if _meter_provider is not None:
@@ -195,4 +209,4 @@ def shutdown_metrics() -> None:
         except Exception:
             pass
         _meter_provider = None
-    _metric_reader = None
+    _metric_readers = []
