@@ -3,10 +3,11 @@ DB Inject - Direct insertion of S3 events into the DB for benchmarks (no SQS).
 """
 import argparse
 import asyncio
+import logging
 import random
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, UTC
 
 # Add parent directory to PYTHONPATH so config is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -14,9 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import structlog
 from structlog.stdlib import LoggerFactory
 from structlog.types import FilteringBoundLogger
-import logging
 
-from config import load_config, Config
+from config import Config, load_config
 from db_manager import DatabaseManager
 from audit_matcher import AuditPointMatcher
 from models import S3Event
@@ -192,7 +192,15 @@ Examples:
         sys.exit(1)
 
     try:
-        asyncio.run(run_inject(load_config(), args.bucket, args.events, args.batch_size, logger=log))
+        asyncio.run(
+            run_inject(
+                load_config(),
+                args.bucket,
+                args.events,
+                args.batch_size,
+                logger=log,
+            )
+        )
     except Exception as e:
         log.error("db_inject_failed", error=str(e))
         sys.exit(1)

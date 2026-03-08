@@ -3,21 +3,22 @@ SQS Ingest - Script to inject test S3 events into SQS queue
 """
 import argparse
 import json
-import sys
+import logging
 import random
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, UTC
 
 # Add parent directory to PYTHONPATH so config is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import logging
 import boto3
-from botocore.exceptions import ClientError
-from config import load_config, Config
 import structlog
+from botocore.exceptions import ClientError
 from structlog.stdlib import LoggerFactory
 from structlog.types import FilteringBoundLogger
+
+from config import Config, load_config
 
 def generate_s3_events(bucket: str, num_events: int) -> list[dict]:
     """
@@ -235,7 +236,13 @@ Examples:
         sys.exit(1)
 
     try:
-        run_ingest(load_config(), args.bucket, args.messages, args.events_per_message, logger=log)
+        run_ingest(
+            load_config(),
+            args.bucket,
+            args.messages,
+            args.events_per_message,
+            logger=log,
+        )
     except Exception as e:
         log.error("sqs_ingest_failed", error=str(e))
         sys.exit(1)
