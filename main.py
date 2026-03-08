@@ -3,10 +3,9 @@ Main - Entry point for S3 Event Processor
 """
 import asyncio
 import argparse
+import logging
 import signal
 import sys
-import logging
-from typing import Optional
 import structlog
 from structlog.stdlib import LoggerFactory
 
@@ -17,35 +16,52 @@ from sqs_consumer import SQSConsumer
 from event_processor import EventProcessor
 from telemetry import init_metrics, instruments, shutdown_metrics
 
-# Configure standard Python logging
-logging.basicConfig(
-    format="%(message)s",
-    stream=sys.stdout,
-    level=logging.INFO,
-)
-
-# Logging configuration
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
+# Minimal bootstrap logger — used only if configuration fails before structlog
+# is fully configured. Replaced by the structured logger once setup_logging() runs.
+logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
 logger = structlog.get_logger(__name__)
 
 # Global flag for graceful shutdown
 shutdown_event = asyncio.Event()
+
+
+def setup_logging(log_level_str: str) -> None:
+    """
+    Configures stdlib logging and structlog from the application log level.
+    Must be called after load_config() so the level is known.
+
+    Args:
+        log_level_str: Log level string from config (e.g. "DEBUG", "INFO", "WARNING")
+    """
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
+    # Reconfigure stdlib root logger with the resolved level
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=log_level,
+        force=True,  # override the bootstrap basicConfig called at module level
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer(),
+        ],
+        # make_filtering_bound_logger applies the level filter directly on the
+        # structlog wrapper — filter_by_level alone is not sufficient.
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        context_class=dict,
+        logger_factory=LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
 
 
 def signal_handler(signum, frame):
@@ -147,8 +163,19 @@ async def sync_audit_points(
         audit_points = await db_manager.load_audit_points()
         matcher.load_audit_points(audit_points)
         logger.debug("audit_points_synced", count=len(audit_points))
+    except ValueError as e:
+        # load_audit_points() raises ValueError if an AuditPoint has an empty bucket
+        # or a None prefix. The matcher is NOT updated — it keeps its previous state.
+        # This is logged as a critical data quality issue: the offending row must be
+        # fixed in the database before the next NOTIFY triggers a reload.
+        logger.error(
+            "audit_sync_invalid_data",
+            error=str(e),
+            matcher_state="unchanged",
+            action_required="fix invalid audit_point row in database",
+        )
     except Exception as e:
-        logger.error("audit_sync_error", error=str(e))
+        logger.error("audit_sync_error", error=str(e), matcher_state="unchanged")
 
 
 async def listen_audit_points_changes(
@@ -193,22 +220,33 @@ async def main() -> None:
     """Main entry point"""
     parse_args()
 
-    logger.debug("s3_event_processor_starting")
+    logger.info("s3_event_processor_starting")
 
     # 1. Load configuration
     try:
         config = load_config()
-        logger.debug("configuration_loaded", log_level=config.log_level)
     except Exception as e:
         logger.error("configuration_load_failed", error=str(e))
         sys.exit(1)
 
-    # 2. OpenTelemetry - metrics exported to stdout, optionally to OTLP collector
-    init_metrics(export_interval_seconds=60, otlp_endpoint=config.otlp_endpoint)
-    instr = instruments()
-    logger.debug("telemetry_initialized", export="stdout")
+    # 2. Apply log level from config — must happen before any other log call
+    # so that DEBUG messages are visible when LOG_LEVEL=DEBUG, and filtered
+    # when LOG_LEVEL=INFO or higher.
+    setup_logging(config.log_level)
+    logger.info("configuration_loaded", log_level=config.log_level)
 
-    # 3. Create PostgreSQL connection pool
+    # 3. OpenTelemetry - metrics exported to stdout, optionally to OTLP collector
+    init_metrics(
+        export_interval_seconds=config.otel_export_interval_seconds,
+        otlp_endpoint=config.otlp_endpoint,
+    )
+    instr = instruments()
+    logger.info("telemetry_initialized",
+                export="stdout",
+                otlp=bool(config.otlp_endpoint),
+                export_interval_seconds=config.otel_export_interval_seconds)
+
+    # 4. Create PostgreSQL connection pool
     try:
         db_manager = await DatabaseManager.create(
             config.get_db_dsn(),
@@ -220,18 +258,20 @@ async def main() -> None:
             logger.error("database_health_check_failed")
             sys.exit(1)
 
-        logger.debug("database_connection_ok")
+        logger.info("database_connection_ok",
+                    pool_min=config.db_pool_min_size,
+                    pool_max=config.db_pool_max_size)
     except Exception as e:
         logger.error("database_connection_failed", error=str(e))
         sys.exit(1)
 
-    # 4. Load audit points
+    # 5. Load audit points
     try:
         audit_points = await db_manager.load_audit_points()
         matcher = AuditPointMatcher(audit_points)
 
         stats = matcher.get_stats()
-        logger.debug("audit_matcher_initialized", stats=stats)
+        logger.info("audit_matcher_initialized", stats=stats)
 
         if len(audit_points) == 0:
             logger.warning(
@@ -243,13 +283,17 @@ async def main() -> None:
         await db_manager.pool.close()
         sys.exit(1)
 
-    # 5. Create and start SQS consumer (persistent client)
+    # 6. Create and start SQS consumer (persistent client)
     try:
         sqs_consumer = SQSConsumer(
             queue_url=config.sqs_queue_url,
             instruments=instr,
             region_name=config.aws_region,
-            aws_access_key_id=config.aws_access_key_id,
+            # Both aws_access_key_id and aws_secret_access_key are SecretStr in Config.
+            # .get_secret_value() is required to extract the plain string; passing the
+            # SecretStr object directly would cause a type mismatch and would expose the
+            # repr ("**********") rather than the actual value to boto3.
+            aws_access_key_id=config.aws_access_key_id.get_secret_value() if config.aws_access_key_id else None,
             aws_secret_access_key=config.aws_secret_access_key.get_secret_value() if config.aws_secret_access_key else None,
             max_messages=config.sqs_batch_size,
             wait_time_seconds=config.sqs_wait_time_seconds,
@@ -257,41 +301,39 @@ async def main() -> None:
             endpoint_url=config.aws_endpoint_url,
         )
         await sqs_consumer.start()
-        logger.debug("sqs_consumer_initialized")
+        logger.info("sqs_consumer_initialized",
+                    queue_url=config.sqs_queue_url,
+                    region=config.aws_region,
+                    batch_size=config.sqs_batch_size)
     except Exception as e:
         logger.error("sqs_consumer_init_failed", error=str(e))
         await db_manager.pool.close()
         sys.exit(1)
 
-    # 6. Create event processor
+    # 7. Create event processor
     processor = EventProcessor(matcher, db_manager, instruments=instr)
     logger.debug("event_processor_initialized")
 
-    # 7. Configure signal handlers
+    # 8. Configure signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 8. Start workers
-    logger.debug("starting_workers")
-
+    # 9. Start workers
     tasks = [
         asyncio.create_task(process_messages_loop(sqs_consumer, processor)),
         asyncio.create_task(listen_audit_points_changes(matcher, db_manager)),
     ]
 
-    logger.debug(
+    logger.info(
         "workers_started",
-        workers=[
-            "sqs_message_processor",
-            "audit_points_listener (NOTIFY)",
-        ],
-        metrics="OpenTelemetry stdout (every 60s)",
+        workers=["sqs_message_processor", "audit_points_listener"],
+        metrics_export_interval_seconds=config.otel_export_interval_seconds,
     )
 
-    # 9. Wait for shutdown
+    # 10. Wait for shutdown
     await shutdown_event.wait()
 
-    # 10. Shutdown gracefully
+    # 11. Shutdown gracefully
     logger.debug("shutting_down")
 
     for task in tasks:

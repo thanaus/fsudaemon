@@ -12,6 +12,13 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# Number of columns passed as parameters in the INSERT statement:
+# event_time, event_name, bucket, object_key, size, version_id, audit_point_ids
+_INSERT_COLS = 7
+# Maximum number of events per INSERT before hitting PostgreSQL's 65535-parameter limit
+# (65535 // 7 = 9362 events max per query)
+_MAX_BATCH_SIZE = 65535 // _INSERT_COLS  # = 9362 events
+
 
 class DatabaseManager:
     """Asynchronous PostgreSQL database manager"""
@@ -87,6 +94,9 @@ class DatabaseManager:
         Inserts a batch of S3 events with their audit point IDs.
         Uses ON CONFLICT DO NOTHING for idempotence (restart / SQS replay without duplicates).
 
+        If the batch exceeds PostgreSQL's 65535-parameter limit (_MAX_BATCH_SIZE events),
+        it is automatically split into sub-batches and results are accumulated.
+
         Args:
             events: List of S3 events to insert
 
@@ -96,7 +106,28 @@ class DatabaseManager:
         if not events:
             return 0, 0.0
 
-        n_cols = 7  # event_time, event_name, bucket, object_key, size, version_id, audit_point_ids
+        if len(events) <= _MAX_BATCH_SIZE:
+            return await self._insert_batch(events)
+
+        # Split into sub-batches to stay within the PostgreSQL parameter limit
+        total, db_time = 0, 0.0
+        for i in range(0, len(events), _MAX_BATCH_SIZE):
+            n, t = await self._insert_batch(events[i : i + _MAX_BATCH_SIZE])
+            total += n
+            db_time += t
+        return total, db_time
+
+    async def _insert_batch(self, events: list[S3Event]) -> tuple[int, float]:
+        """
+        Inserts a single batch of S3 events. Callers must ensure len(events) <= _MAX_BATCH_SIZE.
+
+        Args:
+            events: List of S3 events to insert (must be non-empty)
+
+        Returns:
+            Tuple of (number of events in batch, time spent in DB in seconds)
+        """
+        n_cols = _INSERT_COLS
         placeholders = []
         args: list[object] = []
         for i, event in enumerate(events):

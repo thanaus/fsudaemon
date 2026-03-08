@@ -173,21 +173,3 @@ class SQSConsumer:
         except Exception as e:
             logger.error("sqs_batch_delete_error", error=str(e))
             return deleted_count
-
-    async def get_queue_attributes(self) -> Dict[str, Any]:
-        """
-        Retrieves SQS queue attributes (message count, etc.).
-
-        Returns:
-            Dictionary of queue attributes
-        """
-        try:
-            response = await self._client.get_queue_attributes(
-                QueueUrl=self.queue_url,
-                AttributeNames=['All']
-            )
-            return response.get('Attributes', {})
-
-        except Exception as e:
-            logger.error("sqs_get_attributes_error", error=str(e))
-            return {}

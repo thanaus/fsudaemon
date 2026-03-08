@@ -4,6 +4,7 @@ Event Processor - Orchestration of S3 event processing
 import json
 from typing import List, Dict, Any
 from datetime import datetime, timezone
+from urllib.parse import unquote_plus
 from models import S3Event
 from audit_matcher import AuditPointMatcher
 from db_manager import DatabaseManager
@@ -121,7 +122,13 @@ class EventProcessor:
             s3_data = record.get('s3', {})
             bucket = s3_data.get('bucket', {}).get('name', '')
             obj = s3_data.get('object', {})
-            key = obj.get('key', '')
+
+            # AWS URL-encodes S3 object keys in SQS event notifications:
+            # spaces → '+', special chars → '%XX' (e.g. "my file.txt" → "my+file.txt").
+            # unquote_plus restores the real key so what we store in DB matches
+            # the actual S3 object name and can be used directly with the S3 API.
+            key = unquote_plus(obj.get('key', ''))
+
             size = obj.get('size', 0)
             version_id = obj.get('versionId')
             

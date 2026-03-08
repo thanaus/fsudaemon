@@ -1,11 +1,19 @@
 """
 Centralized configuration for S3 Event Processor
 """
+import re
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Matches a valid hostname (e.g. localhost, db.internal, my-host.example.com)
+_HOSTNAME_RE = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+)
+# Matches a valid IPv4 address (e.g. 127.0.0.1)
+_IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 
 # Project root (where config.py and .env live) so .env is loaded regardless of CWD
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -40,12 +48,25 @@ class Config(BaseSettings):
 
     # OpenTelemetry OTLP (optional)
     otlp_endpoint: str | None = None
+    otel_export_interval_seconds: int = 60
 
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
     )
+
+    @field_validator("db_host")
+    @classmethod
+    def validate_db_host(cls, v: str) -> str:
+        if not v:
+            raise ValueError("db_host must not be empty")
+        if not (_HOSTNAME_RE.match(v) or _IPV4_RE.match(v)):
+            raise ValueError(
+                f"Invalid db_host: {v!r}. Must be a valid hostname (e.g. localhost, "
+                "db.internal) or IPv4 address (e.g. 127.0.0.1)"
+            )
+        return v
 
     @field_validator("sqs_batch_size")
     @classmethod
@@ -81,6 +102,13 @@ class Config(BaseSettings):
     def validate_http_endpoint(cls, v: str | None) -> str | None:
         if v is not None and not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError(f"Endpoint must start with http:// or https://: {v!r}")
+        return v
+
+    @field_validator("otel_export_interval_seconds")
+    @classmethod
+    def validate_otel_export_interval(cls, v: int) -> int:
+        if not 1 <= v <= 3600:
+            raise ValueError("otel_export_interval_seconds must be between 1 and 3600")
         return v
 
     @model_validator(mode="after")
